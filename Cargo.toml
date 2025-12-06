@@ -1,5 +1,9 @@
 [package]
 name = "imeye-rs"
+description = "A simple image viewer written in Rust using OpenGL and winit."
+license = "BSD-2-Clause"
+repository = "https://github.com/Dr-42/imeye-rs"
+homepage = "https://github.com/Dr-42/imeye-rs"
 version = "0.1.0"
 edition = "2021"
 
