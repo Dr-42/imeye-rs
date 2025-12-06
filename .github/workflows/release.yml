@@ -74,7 +74,7 @@ jobs:
         with:
           path: artifacts
 
-      - name's release asset
+      - name: Upload release asset
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
