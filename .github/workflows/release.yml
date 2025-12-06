@@ -36,7 +36,7 @@ jobs:
             echo "ASSET=target/release/imeye-rs-linux-x86_64" >> $GITHUB_ENV
           fi
       - name: Upload artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: imeye-rs-${{ matrix.os }}
           path: ${{ env.ASSET }}
@@ -70,7 +70,7 @@ jobs:
         uses: dawidd6/action-get-tag@v1
 
       - name: Download artifacts
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
 
