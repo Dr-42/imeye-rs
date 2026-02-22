@@ -1,4 +1,3 @@
-use std::env;
 use std::ffi::CString;
 use std::fs;
 use std::num::NonZeroU32;
@@ -467,14 +466,6 @@ impl AppState {
 }
 
 fn main() {
-    #[cfg(target_os = "linux")]
-    {
-        if env::var("__NV_PRIME_RENDER_OFFLOAD").is_err() {
-            env::set_var("__NV_PRIME_RENDER_OFFLOAD", "1");
-            env::set_var("__GLX_VENDOR_LIBRARY_NAME", "nvidia");
-        }
-    }
-
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 {
         println!("Usage: imeye_rs <filename>");
@@ -482,7 +473,15 @@ fn main() {
     }
     let filepath = PathBuf::from(&args[1]);
 
-    let event_loop = EventLoop::new().unwrap();
+    let event_loop = EventLoop::new().unwrap_or_else(|e| {
+        eprintln!("Error: Failed to create event loop: {}", e);
+        eprintln!("\nThis often happens on Linux when windowing system libraries are missing or incompatible.");
+        eprintln!("Ensure you have the following libraries installed:");
+        eprintln!("  - Wayland: libwayland-client, libxkbcommon");
+        eprintln!("  - X11: libX11, libxkbcommon");
+        eprintln!("\nIf you are using Nix, ensure they are available in your shell environment.");
+        std::process::exit(1);
+    });
     let window_builder = WindowBuilder::new()
         .with_title("imeye-rs")
         .with_visible(true);
@@ -501,11 +500,11 @@ fn main() {
                         accum
                     }
                 })
-                .unwrap()
+                .expect("Failed to find a suitable OpenGL configuration.")
         })
-        .unwrap();
+        .expect("Failed to build the display. Ensure OpenGL drivers are installed.");
 
-    let window = window.unwrap();
+    let window = window.expect("Failed to create the window.");
     let raw_window_handle = window.raw_window_handle();
     let gl_display = gl_config.display();
     let context_attributes = ContextAttributesBuilder::new().build(Some(raw_window_handle));
@@ -520,11 +519,11 @@ fn main() {
     let gl_surface = unsafe {
         gl_display
             .create_window_surface(&gl_config, &attrs)
-            .unwrap()
+            .expect("Failed to create the OpenGL window surface.")
     };
-    let gl_context = not_current_gl_context.make_current(&gl_surface).unwrap();
+    let gl_context = not_current_gl_context.make_current(&gl_surface).expect("Failed to make the OpenGL context current.");
 
-    gl::load_with(|symbol| gl_display.get_proc_address(&CString::new(symbol).unwrap()) as *const _);
+    gl::load_with(|symbol| gl_display.get_proc_address(&CString::new(symbol).expect("Failed to create CString for GL symbol")));
 
     let monitor_size = if let Some(monitor) = window.current_monitor() {
         (monitor.size().width, monitor.size().height)
