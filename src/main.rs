@@ -1,11 +1,11 @@
 use std::ffi::CString;
 use std::fs;
+use std::io::Read;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
-use std::io::Cursor;
 
 use glutin::config::ConfigTemplateBuilder;
 use glutin::context::{ContextAttributesBuilder, NotCurrentGlContext};
@@ -73,25 +73,12 @@ const FRAG_SHADER_SRC: &str = r#"
     
     void main() {   
         if (is_spinner == 1) {
-            // Normalize UVs to -0.5 -> 0.5 range for centering
             vec2 uv = TexCoords - 0.5;
             float dist = length(uv);
-            
-            // Calculate angle for the comet tail effect (-PI to PI)
             float angle = atan(uv.y, uv.x);
-            
-            // Map angle to 0.0 -> 1.0 range
             float val = (angle + 3.14159) / 6.28318;
-            
-            // Create the ring shape (Radius ~0.35, Thickness ~0.1)
-            // Use smoothstep for nice anti-aliased edges
             float ring = smoothstep(0.25, 0.30, dist) * (1.0 - smoothstep(0.40, 0.45, dist));
-            
-            // Apply gradient: val^2 makes the tail fade out nicely (comet look)
             float brightness = pow(val, 2.0);
-            
-            // Combine ring shape with gradient brightness
-            // Color: Bright Blue-ish (0.2, 0.6, 1.0)
             color = vec4(0.2, 0.6, 1.0, ring * brightness);
         } else {
             vec4 texColor = texture(image, TexCoords);
@@ -305,97 +292,69 @@ impl AppState {
         (shader_program, vao, tex_id, w, h)
     }
 
+    /// Blazingly fast image decoder. Tries standard load, falls back to raw byte-scanning 
+    /// the file buffer to extract the largest embedded JPEG blob. Bypasses demosaicing entirely.
     fn decode_image_to_rgba(path: &Path) -> Result<(Vec<u8>, i32, i32), String> {
-        if let Ok(img) = image::open(path) {
+        // Read the whole file into a memory buffer
+        let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
+        let mut data = Vec::new();
+        file.read_to_end(&mut data).map_err(|e| e.to_string())?;
+
+        // 1. Try standard image decode first (for PNG, normal JPG, etc.)
+        if let Ok(img) = image::load_from_memory(&data) {
             let (w, h) = (img.width() as i32, img.height() as i32);
             return Ok((img.to_rgba8().into_raw(), w, h));
         }
 
-        let img = rawler::decode_file(path).map_err(|e| format!("Rawler failed: {:?}", e))?;
+        // 2. Brute-force Embedded JPEG Extractor for RAW files
+        let mut starts = Vec::new();
         
-        let u16_pixels = img.pixels_u16();
-        let mut img_bytes = Vec::with_capacity(u16_pixels.len() * 2);
-        for &p in u16_pixels {
-            img_bytes.extend_from_slice(&p.to_le_bytes());
-        }
-        
-        let (w, h) = (img.width as usize, img.height as usize);
-        let depth = bayer::BayerDepth::Depth16LE;
-        let cfa = bayer::CFA::RGGB;
-
-        let mut buf = vec![0u8; w * h * 6];
-
-        let mut dst = bayer::RasterMut::new(
-            w, h, bayer::RasterDepth::Depth16,
-            &mut buf
-        );
-        
-        bayer::run_demosaic(
-            &mut Cursor::new(&img_bytes[..]), 
-            depth, 
-            cfa, 
-            bayer::Demosaic::Linear, 
-            &mut dst
-        ).map_err(|_| "Failed to run demosaic".to_string())?;
-
-        // --- 1. Calculate Auto-Black Level and Gray World Averages ---
-        let mut min_val = u16::MAX;
-        let mut sum_r = 0u64;
-        let mut sum_g = 0u64;
-        let mut sum_b = 0u64;
-        let pixel_count = (w * h) as u64;
-
-        for chunk in buf.chunks_exact(6) {
-            let r = u16::from_ne_bytes([chunk[0], chunk[1]]);
-            let g = u16::from_ne_bytes([chunk[2], chunk[3]]);
-            let b = u16::from_ne_bytes([chunk[4], chunk[5]]);
-            
-            min_val = min_val.min(r).min(g).min(b);
-            sum_r += r as u64;
-            sum_g += g as u64;
-            sum_b += b as u64;
+        // Scan for JPEG Start of Image (SOI) marker: FF D8. 
+        // We look for FF D8 FF to avoid false positives (next marker always starts with FF).
+        for i in 0..data.len().saturating_sub(2) {
+            if data[i] == 0xFF && data[i+1] == 0xD8 && data[i+2] == 0xFF {
+                starts.push(i);
+            }
         }
 
-        let avg_r = (sum_r as f32) / (pixel_count as f32);
-        let avg_g = (sum_g as f32) / (pixel_count as f32);
-        let avg_b = (sum_b as f32) / (pixel_count as f32);
-
-        // Gray World assumption: G is baseline. Boost R and B to match G's average intensity.
-        let gain_r = avg_g / avg_r;
-        let gain_g = 1.0f32;
-        let gain_b = avg_g / avg_b;
-        let black_level = min_val as f32;
-
-        // --- 2. Calculate the True Max for Normalization ---
-        let mut max_val = 1.0f32;
-        for chunk in buf.chunks_exact(6) {
-            let r = (u16::from_ne_bytes([chunk[0], chunk[1]]) as f32 - black_level).max(0.0) * gain_r;
-            let g = (u16::from_ne_bytes([chunk[2], chunk[3]]) as f32 - black_level).max(0.0) * gain_g;
-            let b = (u16::from_ne_bytes([chunk[4], chunk[5]]) as f32 - black_level).max(0.0) * gain_b;
-            
-            max_val = max_val.max(r).max(g).max(b);
-        }
-
-        // --- 3. Apply Black Level, White Balance, Normalization, and Gamma ---
-        let gamma = 2.2f32;
-        let mut rgba_buf = Vec::with_capacity(w * h * 4);
+        let mut largest_slice: &[u8] = &[];
         
-        for chunk in buf.chunks_exact(6) {
-            let r = (u16::from_ne_bytes([chunk[0], chunk[1]]) as f32 - black_level).max(0.0) * gain_r;
-            let g = (u16::from_ne_bytes([chunk[2], chunk[3]]) as f32 - black_level).max(0.0) * gain_g;
-            let b = (u16::from_ne_bytes([chunk[4], chunk[5]]) as f32 - black_level).max(0.0) * gain_b;
-            
-            let r_norm = r / max_val;
-            let g_norm = g / max_val;
-            let b_norm = b / max_val;
-            
-            rgba_buf.push((r_norm.powf(1.0 / gamma) * 255.0).clamp(0.0, 255.0) as u8);
-            rgba_buf.push((g_norm.powf(1.0 / gamma) * 255.0).clamp(0.0, 255.0) as u8);
-            rgba_buf.push((b_norm.powf(1.0 / gamma) * 255.0).clamp(0.0, 255.0) as u8);
-            rgba_buf.push(255); // A
+        for (idx, &start) in starts.iter().enumerate() {
+            let end_search_limit = if idx + 1 < starts.len() {
+                starts[idx + 1]
+            } else {
+                data.len()
+            };
+
+            let mut end = end_search_limit;
+            // Search backwards from the end limit to find the End of Image (EOI) marker: FF D9
+            while end > start + 1 {
+                if data[end - 2] == 0xFF && data[end - 1] == 0xD9 {
+                    break;
+                }
+                end -= 1;
+            }
+
+            // If we found a valid boundary, check if it's our biggest payload so far
+            if end > start + 1 {
+                let slice = &data[start..end];
+                if slice.len() > largest_slice.len() {
+                    largest_slice = slice;
+                }
+            }
         }
 
-        Ok((rgba_buf, w as i32, h as i32))
+        if largest_slice.is_empty() {
+            return Err("No embedded JPEG found in RAW file".to_string());
+        }
+
+        // Decode the extracted JPEG slice directly
+        let img = image::load_from_memory_with_format(largest_slice, image::ImageFormat::Jpeg)
+            .map_err(|e| format!("Failed to decode embedded JPEG: {}", e))?;
+        
+        let w = img.width() as i32;
+        let h = img.height() as i32;
+        Ok((img.to_rgba8().into_raw(), w, h))
     }
 
     unsafe fn load_texture_sync(path: &Path) -> (u32, i32, i32) {
