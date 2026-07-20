@@ -415,7 +415,7 @@ impl AppState {
 
         self.view_x = (disp_w - current_w) / 2.0;
         self.view_y = (disp_h - current_h) / 2.0;
-        self.rotation = 0;
+        self.rotation = self.rotation;
     }
 
     fn trigger_load_next(&mut self, direction: i32) {
@@ -484,8 +484,16 @@ impl AppState {
             let (new_tex, w, h) = Self::upload_texture(&image.pixels, image.width, image.height);
             gl::DeleteTextures(1, &self.texture);
             self.texture = new_tex;
-            self.base_width = w as f32;
-            self.base_height = h as f32;
+            
+            // FIX: Preserve existing rotation by mapping the new image's native 
+            // dimensions to the correct screen-space viewport axes.
+            if self.rotation == 90 || self.rotation == 270 {
+                self.base_width = h as f32;
+                self.base_height = w as f32;
+            } else {
+                self.base_width = w as f32;
+                self.base_height = h as f32;
+            }
 
             let prev_area = prev_width * prev_height;
             let new_area = self.base_width * self.base_height;
@@ -506,8 +514,6 @@ impl AppState {
 
             self.view_x = prev_center_x - new_w / 2.0;
             self.view_y = prev_center_y - new_h / 2.0;
-
-            self.rotation = 0;
         }
     }
 
