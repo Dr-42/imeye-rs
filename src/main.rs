@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::io::Cursor;
 
 use glutin::config::ConfigTemplateBuilder;
 use glutin::context::{ContextAttributesBuilder, NotCurrentGlContext};
@@ -222,7 +223,7 @@ impl AppState {
         let parent = target.parent().unwrap_or(Path::new("."));
         let mut images = Vec::new();
         let valid_exts = [
-            "png", "jpg", "jpeg", "bmp", "tga", "gif", "hdr", "pic", "pnm",
+            "png", "jpg", "jpeg", "bmp", "tga", "gif", "hdr", "pic", "pnm", "arw",
         ];
 
         if let Ok(entries) = fs::read_dir(parent) {
@@ -315,11 +316,65 @@ impl AppState {
         (shader_program, vao, tex_id, w, h)
     }
 
-    unsafe fn load_texture_sync(path: &Path) -> (u32, i32, i32) {
-        // OPTIMIZATION: removed .flipv()
-        let img = image::open(path).expect("Failed to load image");
-        let (w, h) = (img.width() as i32, img.height() as i32);
-        Self::upload_texture(img.to_rgba8().as_raw(), w, h)
+unsafe fn load_texture_sync(path: &Path) -> (u32, i32, i32) {
+        let img = rawler::decode_file(path).expect("Failed to load image");
+        
+        let u16_pixels = img.pixels_u16();
+        
+        // Convert u16 pixels to little-endian bytes properly for bayer Depth16LE
+        let mut img_bytes = Vec::with_capacity(u16_pixels.len() * 2);
+        for &p in u16_pixels {
+            img_bytes.extend_from_slice(&p.to_le_bytes());
+        }
+        
+        let (w, h) = (img.width as usize, img.height as usize);
+        
+        let depth = bayer::BayerDepth::Depth16LE;
+        let cfa = bayer::CFA::RGGB;
+
+        // Since input is Depth16LE, output must be Depth16.
+        // Depth16 uses 6 bytes per pixel (RGB, 2 bytes per channel).
+        let mut buf = vec![0u8; w * h * 6];
+
+        let mut dst = bayer::RasterMut::new(
+            w, h, bayer::RasterDepth::Depth16,
+            &mut buf
+        );
+        
+        bayer::run_demosaic(
+            &mut Cursor::new(&img_bytes[..]), 
+            depth, 
+            cfa, 
+            bayer::Demosaic::Linear, 
+            &mut dst
+        ).expect("Failed to run demosaic");
+        
+        // Find the maximum pixel value for normalization. 
+        // RAW files are often 12-bit or 14-bit, not full 16-bit.
+        // Without scaling, the image will appear extremely dark.
+        let mut max_val = 1;
+        for chunk in buf.chunks_exact(2) {
+            let val = u16::from_ne_bytes([chunk[0], chunk[1]]);
+            if val > max_val { 
+                max_val = val; 
+            }
+        }
+        let scale = 255.0 / (max_val as f32);
+
+        // Downsample the 16-bit RGB buffer to 8-bit RGBA for OpenGL upload
+        let mut rgba_buf = Vec::with_capacity(w * h * 4);
+        for chunk in buf.chunks_exact(6) {
+            let r = u16::from_ne_bytes([chunk[0], chunk[1]]);
+            let g = u16::from_ne_bytes([chunk[2], chunk[3]]);
+            let b = u16::from_ne_bytes([chunk[4], chunk[5]]);
+            
+            rgba_buf.push(((r as f32) * scale).clamp(0.0, 255.0) as u8);
+            rgba_buf.push(((g as f32) * scale).clamp(0.0, 255.0) as u8);
+            rgba_buf.push(((b as f32) * scale).clamp(0.0, 255.0) as u8);
+            rgba_buf.push(255); // A
+        }
+
+        Self::upload_texture(&rgba_buf, w as i32, h as i32)
     }
 
     unsafe fn upload_texture(data: &[u8], w: i32, h: i32) -> (u32, i32, i32) {

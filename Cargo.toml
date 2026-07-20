@@ -14,3 +14,6 @@ glutin-winit = "0.4"
 gl = "0.14"
 image = "0.24"
 raw-window-handle = "0.5.2"
+rawler = "0.7.2"
+bayer = "0.1"
+rawshift = { version = "0.1.1", features = ["image"] }
