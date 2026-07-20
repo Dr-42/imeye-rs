@@ -617,12 +617,40 @@ fn main() {
             Event::WindowEvent { event, .. } => match event {
                 WindowEvent::CloseRequested => elwt.exit(),
 
+                WindowEvent::MouseInput { state, button: MouseButton::Left,  ..} => {
+                    // Next image
+                    if state == ElementState::Pressed {
+                        app_state.trigger_load_next(1);
+                    }
+                }
+                WindowEvent::MouseInput { state, button: MouseButton::Right,  ..} => {
+                    // Previous image
+                    if state == ElementState::Pressed {
+                        app_state.trigger_load_next(-1);
+                    }
+                }
+
                 WindowEvent::MouseInput {
                     state,
-                    button: MouseButton::Left,
+                    button: MouseButton::Middle,
                     ..
                 } => {
                     app_state.is_dragging = state == ElementState::Pressed;
+                }
+                WindowEvent::MouseInput { state, button: MouseButton::Forward,  ..} => {
+                    // Rotate 90 degrees clockwise
+                    // Fire only on mouse release
+                    if state == ElementState::Released {
+                        app_state.rotate(1);
+                    }
+                }
+                WindowEvent::MouseInput { state, button: MouseButton::Back,  ..} => {
+                    // Rotate 90 degrees counter-clockwise
+                    // Fire only on mouse release
+                    if state == ElementState::Released {
+                        app_state.rotate(-1);
+                    }
+
                 }
                 WindowEvent::CursorMoved { position, .. } => {
                     app_state.mouse_pos = (position.x, position.y);
