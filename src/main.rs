@@ -103,7 +103,6 @@ const FRAG_SHADER_SRC: &str = r#"
 "#;
 
 // OPTIMIZATION: Texture Coordinates flipped here (V: 0.0 <-> 1.0)
-// This avoids the expensive CPU-side image.flipv() operation.
 const VERTICES: [f32; 20] = [
     // Position         // Tex coords (V flipped)
     1.0, 1.0, -1.0, 1.0, 0.0, // Top Right
@@ -118,6 +117,7 @@ struct LoadedImage {
     width: i32,
     height: i32,
     generation_id: u64,
+    success: bool,
 }
 
 struct AppState {
@@ -126,31 +126,24 @@ struct AppState {
     vao: u32,
     texture: u32,
 
-    // Dimensions
     base_width: f32,
     base_height: f32,
-
-    // Viewport State
     view_x: f32,
     view_y: f32,
     rotation: i32,
 
-    // Zoom Math
     zoom_level: f32,
     target_zoom: f32,
     zoom_focus: (f32, f32),
 
-    // Mouse
     is_dragging: bool,
     last_mouse_pos: Option<(f64, f64)>,
     mouse_pos: (f64, f64),
 
-    // Navigation & Async Loading
     image_list: Vec<PathBuf>,
     image_index: usize,
     monitor_size: (u32, u32),
 
-    // Async State
     loading: bool,
     load_generation: u64,
     rx: Receiver<LoadedImage>,
@@ -202,7 +195,6 @@ impl AppState {
             self.zoom_level = Self::lerp(self.zoom_level, self.target_zoom, 0.15);
             let new_zoom = self.zoom_level;
 
-            // Invariant Point Zoom Math
             let focus_x = self.zoom_focus.0;
             let focus_y = self.zoom_focus.1;
             let ratio = new_zoom / old_zoom;
@@ -214,7 +206,6 @@ impl AppState {
         }
 
         if self.loading {
-            // 8.0 degrees per frame at 60fps is smooth and not too fast
             self.spinner_rotation = (self.spinner_rotation + 8.0) % 360.0;
         }
     }
@@ -261,7 +252,6 @@ impl AppState {
         gl::DeleteShader(vertex_shader);
         gl::DeleteShader(fragment_shader);
 
-        // Enable Alpha Blending for the spinner's smooth transparency
         gl::Enable(gl::BLEND);
         gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
         gl::ClearColor(0.0, 0.0, 0.0, 1.0);
@@ -311,29 +301,28 @@ impl AppState {
         );
         gl::EnableVertexAttribArray(tex_attrib as u32);
 
-        // Initial sync load
         let (tex_id, w, h) = Self::load_texture_sync(path);
         (shader_program, vao, tex_id, w, h)
     }
 
-unsafe fn load_texture_sync(path: &Path) -> (u32, i32, i32) {
-        let img = rawler::decode_file(path).expect("Failed to load image");
+    fn decode_image_to_rgba(path: &Path) -> Result<(Vec<u8>, i32, i32), String> {
+        if let Ok(img) = image::open(path) {
+            let (w, h) = (img.width() as i32, img.height() as i32);
+            return Ok((img.to_rgba8().into_raw(), w, h));
+        }
+
+        let img = rawler::decode_file(path).map_err(|e| format!("Rawler failed: {:?}", e))?;
         
         let u16_pixels = img.pixels_u16();
-        
-        // Convert u16 pixels to little-endian bytes properly for bayer Depth16LE
         let mut img_bytes = Vec::with_capacity(u16_pixels.len() * 2);
         for &p in u16_pixels {
             img_bytes.extend_from_slice(&p.to_le_bytes());
         }
         
         let (w, h) = (img.width as usize, img.height as usize);
-        
         let depth = bayer::BayerDepth::Depth16LE;
         let cfa = bayer::CFA::RGGB;
 
-        // Since input is Depth16LE, output must be Depth16.
-        // Depth16 uses 6 bytes per pixel (RGB, 2 bytes per channel).
         let mut buf = vec![0u8; w * h * 6];
 
         let mut dst = bayer::RasterMut::new(
@@ -347,34 +336,77 @@ unsafe fn load_texture_sync(path: &Path) -> (u32, i32, i32) {
             cfa, 
             bayer::Demosaic::Linear, 
             &mut dst
-        ).expect("Failed to run demosaic");
-        
-        // Find the maximum pixel value for normalization. 
-        // RAW files are often 12-bit or 14-bit, not full 16-bit.
-        // Without scaling, the image will appear extremely dark.
-        let mut max_val = 1;
-        for chunk in buf.chunks_exact(2) {
-            let val = u16::from_ne_bytes([chunk[0], chunk[1]]);
-            if val > max_val { 
-                max_val = val; 
-            }
-        }
-        let scale = 255.0 / (max_val as f32);
+        ).map_err(|_| "Failed to run demosaic".to_string())?;
 
-        // Downsample the 16-bit RGB buffer to 8-bit RGBA for OpenGL upload
-        let mut rgba_buf = Vec::with_capacity(w * h * 4);
+        // --- 1. Calculate Auto-Black Level and Gray World Averages ---
+        let mut min_val = u16::MAX;
+        let mut sum_r = 0u64;
+        let mut sum_g = 0u64;
+        let mut sum_b = 0u64;
+        let pixel_count = (w * h) as u64;
+
         for chunk in buf.chunks_exact(6) {
             let r = u16::from_ne_bytes([chunk[0], chunk[1]]);
             let g = u16::from_ne_bytes([chunk[2], chunk[3]]);
             let b = u16::from_ne_bytes([chunk[4], chunk[5]]);
             
-            rgba_buf.push(((r as f32) * scale).clamp(0.0, 255.0) as u8);
-            rgba_buf.push(((g as f32) * scale).clamp(0.0, 255.0) as u8);
-            rgba_buf.push(((b as f32) * scale).clamp(0.0, 255.0) as u8);
+            min_val = min_val.min(r).min(g).min(b);
+            sum_r += r as u64;
+            sum_g += g as u64;
+            sum_b += b as u64;
+        }
+
+        let avg_r = (sum_r as f32) / (pixel_count as f32);
+        let avg_g = (sum_g as f32) / (pixel_count as f32);
+        let avg_b = (sum_b as f32) / (pixel_count as f32);
+
+        // Gray World assumption: G is baseline. Boost R and B to match G's average intensity.
+        let gain_r = avg_g / avg_r;
+        let gain_g = 1.0f32;
+        let gain_b = avg_g / avg_b;
+        let black_level = min_val as f32;
+
+        // --- 2. Calculate the True Max for Normalization ---
+        let mut max_val = 1.0f32;
+        for chunk in buf.chunks_exact(6) {
+            let r = (u16::from_ne_bytes([chunk[0], chunk[1]]) as f32 - black_level).max(0.0) * gain_r;
+            let g = (u16::from_ne_bytes([chunk[2], chunk[3]]) as f32 - black_level).max(0.0) * gain_g;
+            let b = (u16::from_ne_bytes([chunk[4], chunk[5]]) as f32 - black_level).max(0.0) * gain_b;
+            
+            max_val = max_val.max(r).max(g).max(b);
+        }
+
+        // --- 3. Apply Black Level, White Balance, Normalization, and Gamma ---
+        let gamma = 2.2f32;
+        let mut rgba_buf = Vec::with_capacity(w * h * 4);
+        
+        for chunk in buf.chunks_exact(6) {
+            let r = (u16::from_ne_bytes([chunk[0], chunk[1]]) as f32 - black_level).max(0.0) * gain_r;
+            let g = (u16::from_ne_bytes([chunk[2], chunk[3]]) as f32 - black_level).max(0.0) * gain_g;
+            let b = (u16::from_ne_bytes([chunk[4], chunk[5]]) as f32 - black_level).max(0.0) * gain_b;
+            
+            let r_norm = r / max_val;
+            let g_norm = g / max_val;
+            let b_norm = b / max_val;
+            
+            rgba_buf.push((r_norm.powf(1.0 / gamma) * 255.0).clamp(0.0, 255.0) as u8);
+            rgba_buf.push((g_norm.powf(1.0 / gamma) * 255.0).clamp(0.0, 255.0) as u8);
+            rgba_buf.push((b_norm.powf(1.0 / gamma) * 255.0).clamp(0.0, 255.0) as u8);
             rgba_buf.push(255); // A
         }
 
-        Self::upload_texture(&rgba_buf, w as i32, h as i32)
+        Ok((rgba_buf, w as i32, h as i32))
+    }
+
+    unsafe fn load_texture_sync(path: &Path) -> (u32, i32, i32) {
+        match Self::decode_image_to_rgba(path) {
+            Ok((pixels, w, h)) => Self::upload_texture(&pixels, w, h),
+            Err(e) => {
+                eprintln!("Failed to load initial texture: {}", e);
+                let dummy = vec![255, 0, 255, 255];
+                Self::upload_texture(&dummy, 1, 1)
+            }
+        }
     }
 
     unsafe fn upload_texture(data: &[u8], w: i32, h: i32) -> (u32, i32, i32) {
@@ -384,7 +416,6 @@ unsafe fn load_texture_sync(path: &Path) -> (u32, i32, i32) {
 
         gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::REPEAT as i32);
         gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::REPEAT as i32);
-        // OPTIMIZATION: Use GL_LINEAR instead of MIPMAP to avoid blocking generation
         gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
         gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
 
@@ -399,7 +430,6 @@ unsafe fn load_texture_sync(path: &Path) -> (u32, i32, i32) {
             gl::UNSIGNED_BYTE,
             data.as_ptr() as *const _,
         );
-        // OPTIMIZATION: gl::GenerateMipmap removed
 
         (texture, w, h)
     }
@@ -452,17 +482,26 @@ unsafe fn load_texture_sync(path: &Path) -> (u32, i32, i32) {
         let tx = self.tx.clone();
 
         thread::spawn(move || {
-            if let Ok(img) = image::open(&path) {
-                // OPTIMIZATION: removed .flipv()
-                let (w, h) = (img.width() as i32, img.height() as i32);
-                let pixels = img.to_rgba8().into_raw();
-
-                let _ = tx.send(LoadedImage {
-                    pixels,
-                    width: w,
-                    height: h,
-                    generation_id: gen_id,
-                });
+            match Self::decode_image_to_rgba(&path) {
+                Ok((pixels, w, h)) => {
+                    let _ = tx.send(LoadedImage {
+                        pixels,
+                        width: w,
+                        height: h,
+                        generation_id: gen_id,
+                        success: true,
+                    });
+                }
+                Err(e) => {
+                    eprintln!("Failed to load next image at {:?}: {}", path, e);
+                    let _ = tx.send(LoadedImage {
+                        pixels: vec![],
+                        width: 0,
+                        height: 0,
+                        generation_id: gen_id,
+                        success: false,
+                    });
+                }
             }
         });
     }
@@ -473,6 +512,11 @@ unsafe fn load_texture_sync(path: &Path) -> (u32, i32, i32) {
         }
 
         self.loading = false;
+        
+        if !image.success {
+            return;
+        }
+
         unsafe {
             let prev_width = self.base_width;
             let prev_height = self.base_height;
@@ -484,7 +528,6 @@ unsafe fn load_texture_sync(path: &Path) -> (u32, i32, i32) {
             self.base_width = w as f32;
             self.base_height = h as f32;
 
-            // Maintain perceived scale
             let prev_area = prev_width * prev_height;
             let new_area = self.base_width * self.base_height;
             let area_ratio = if new_area > 0.0 {
@@ -496,7 +539,6 @@ unsafe fn load_texture_sync(path: &Path) -> (u32, i32, i32) {
             self.zoom_level *= area_ratio;
             self.target_zoom = self.zoom_level;
 
-            // Align Centers
             let prev_center_x = self.view_x + (prev_width * prev_zoom) / 2.0;
             let prev_center_y = self.view_y + (prev_height * prev_zoom) / 2.0;
 
