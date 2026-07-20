@@ -60,6 +60,7 @@
           # The missing hook that fixes `cargo run` inside `nix develop`
           shellHook = ''
             export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${pkgs.lib.makeLibraryPath runtimeLibs}
+            export RUSTFLAGS="-C link-arg=-Wl,-rpath,${pkgs.lib.makeLibraryPath runtimeLibs}"
           '';
         };
       });
