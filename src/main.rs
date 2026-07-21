@@ -672,7 +672,7 @@ fn main() {
                     
                     if state == ElementState::Pressed {
                         let now = Instant::now();
-                        if now.duration_since(last_middle_click_time) < Duration::from_millis(250) {
+                        if now.duration_since(last_middle_click_time) < Duration::from_millis(450) {
                             // Double Middle Click -> Close App
                             elwt.exit();
                         }
