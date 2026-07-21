@@ -317,7 +317,7 @@ impl AppState {
             }
         }
 
-        let mut largest_slice: &[u8] = &[];
+        let mut largest_slice: &[u8] = &[]
         
         for (idx, &start) in starts.iter().enumerate() {
             let end_search_limit = if idx + 1 < starts.len() {
@@ -415,7 +415,6 @@ impl AppState {
 
         self.view_x = (disp_w - current_w) / 2.0;
         self.view_y = (disp_h - current_h) / 2.0;
-        self.rotation = self.rotation;
     }
 
     fn trigger_load_next(&mut self, direction: i32) {
@@ -600,6 +599,15 @@ fn main() {
     ));
 
     let mut last_frame = Instant::now();
+    
+    // --- Mouse Click Tracking State ---
+    let mut pending_left_click = false;
+    let mut left_click_timer = Instant::now() - Duration::from_secs(1);
+
+    let mut pending_right_click = false;
+    let mut right_click_timer = Instant::now() - Duration::from_secs(1);
+
+    let mut last_middle_click_time = Instant::now() - Duration::from_secs(1);
 
     let _ = event_loop.run(move |event, elwt| {
         elwt.set_control_flow(ControlFlow::Poll);
@@ -618,15 +626,40 @@ fn main() {
                 WindowEvent::CloseRequested => elwt.exit(),
 
                 WindowEvent::MouseInput { state, button: MouseButton::Left,  ..} => {
-                    // Next image
                     if state == ElementState::Pressed {
-                        app_state.trigger_load_next(1);
+                        let now = Instant::now();
+                        if now.duration_since(left_click_timer) < Duration::from_millis(250) {
+                            // Double Left Click -> Toggle Fullscreen
+                            pending_left_click = false;
+                            left_click_timer = now - Duration::from_secs(1);
+
+                            if window.fullscreen().is_some() {
+                                window.set_fullscreen(None);
+                            } else {
+                                window.set_fullscreen(Some(
+                                    winit::window::Fullscreen::Borderless(
+                                        window.current_monitor(),
+                                    ),
+                                ));
+                            }
+                        } else {
+                            pending_left_click = true;
+                            left_click_timer = now;
+                        }
                     }
                 }
                 WindowEvent::MouseInput { state, button: MouseButton::Right,  ..} => {
-                    // Previous image
                     if state == ElementState::Pressed {
-                        app_state.trigger_load_next(-1);
+                        let now = Instant::now();
+                        if now.duration_since(right_click_timer) < Duration::from_millis(250) {
+                            // Double Right Click -> Reset View
+                            pending_right_click = false;
+                            app_state.reset_view();
+                            right_click_timer = now - Duration::from_secs(1);
+                        } else {
+                            pending_right_click = true;
+                            right_click_timer = now;
+                        }
                     }
                 }
 
@@ -636,21 +669,25 @@ fn main() {
                     ..
                 } => {
                     app_state.is_dragging = state == ElementState::Pressed;
+                    
+                    if state == ElementState::Pressed {
+                        let now = Instant::now();
+                        if now.duration_since(last_middle_click_time) < Duration::from_millis(250) {
+                            // Double Middle Click -> Close App
+                            elwt.exit();
+                        }
+                        last_middle_click_time = now;
+                    }
                 }
                 WindowEvent::MouseInput { state, button: MouseButton::Forward,  ..} => {
-                    // Rotate 90 degrees clockwise
-                    // Fire only on mouse release
                     if state == ElementState::Released {
                         app_state.rotate(1);
                     }
                 }
                 WindowEvent::MouseInput { state, button: MouseButton::Back,  ..} => {
-                    // Rotate 90 degrees counter-clockwise
-                    // Fire only on mouse release
                     if state == ElementState::Released {
                         app_state.rotate(-1);
                     }
-
                 }
                 WindowEvent::CursorMoved { position, .. } => {
                     app_state.mouse_pos = (position.x, position.y);
@@ -793,6 +830,17 @@ fn main() {
                 _ => (),
             },
             Event::AboutToWait => {
+                // --- Single Click Timeouts ---
+                if pending_left_click && left_click_timer.elapsed() >= Duration::from_millis(250) {
+                    app_state.trigger_load_next(1);
+                    pending_left_click = false;
+                }
+
+                if pending_right_click && right_click_timer.elapsed() >= Duration::from_millis(250) {
+                    app_state.trigger_load_next(-1);
+                    pending_right_click = false;
+                }
+
                 let wait_time = if app_state.loading { 8 } else { 16 };
                 if last_frame.elapsed() >= Duration::from_millis(wait_time) {
                     window.request_redraw();
