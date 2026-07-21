@@ -317,7 +317,7 @@ impl AppState {
             }
         }
 
-        let mut largest_slice: &[u8] = &[]
+        let mut largest_slice: &[u8] = &[][..];
         
         for (idx, &start) in starts.iter().enumerate() {
             let end_search_limit = if idx + 1 < starts.len() {
