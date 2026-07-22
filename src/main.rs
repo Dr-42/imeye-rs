@@ -20,6 +20,8 @@ use winit::event_loop::{ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::WindowBuilder;
 
+use gilrs::{Gilrs, Button, Axis};
+
 // --- DEDICATED GPU SELECTION (WINDOWS) ---
 #[cfg(target_os = "windows")]
 #[allow(non_upper_case_globals)]
@@ -292,25 +294,18 @@ impl AppState {
         (shader_program, vao, tex_id, w, h)
     }
 
-    /// Blazingly fast image decoder. Tries standard load, falls back to raw byte-scanning 
-    /// the file buffer to extract the largest embedded JPEG blob. Bypasses demosaicing entirely.
     fn decode_image_to_rgba(path: &Path) -> Result<(Vec<u8>, i32, i32), String> {
-        // Read the whole file into a memory buffer
         let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
         let mut data = Vec::new();
         file.read_to_end(&mut data).map_err(|e| e.to_string())?;
 
-        // 1. Try standard image decode first (for PNG, normal JPG, etc.)
         if let Ok(img) = image::load_from_memory(&data) {
             let (w, h) = (img.width() as i32, img.height() as i32);
             return Ok((img.to_rgba8().into_raw(), w, h));
         }
 
-        // 2. Brute-force Embedded JPEG Extractor for RAW files
         let mut starts = Vec::new();
         
-        // Scan for JPEG Start of Image (SOI) marker: FF D8. 
-        // We look for FF D8 FF to avoid false positives (next marker always starts with FF).
         for i in 0..data.len().saturating_sub(2) {
             if data[i] == 0xFF && data[i+1] == 0xD8 && data[i+2] == 0xFF {
                 starts.push(i);
@@ -327,7 +322,6 @@ impl AppState {
             };
 
             let mut end = end_search_limit;
-            // Search backwards from the end limit to find the End of Image (EOI) marker: FF D9
             while end > start + 1 {
                 if data[end - 2] == 0xFF && data[end - 1] == 0xD9 {
                     break;
@@ -335,7 +329,6 @@ impl AppState {
                 end -= 1;
             }
 
-            // If we found a valid boundary, check if it's our biggest payload so far
             if end > start + 1 {
                 let slice = &data[start..end];
                 if slice.len() > largest_slice.len() {
@@ -348,7 +341,6 @@ impl AppState {
             return Err("No embedded JPEG found in RAW file".to_string());
         }
 
-        // Decode the extracted JPEG slice directly
         let img = image::load_from_memory_with_format(largest_slice, image::ImageFormat::Jpeg)
             .map_err(|e| format!("Failed to decode embedded JPEG: {}", e))?;
         
@@ -484,9 +476,11 @@ impl AppState {
             gl::DeleteTextures(1, &self.texture);
             self.texture = new_tex;
             
-            // FIX: Preserve existing rotation by mapping the new image's native 
-            // dimensions to the correct screen-space viewport axes.
-            if self.rotation == 90 || self.rotation == 270 {
+            // FIX: Normalize the rotation using Euclidean remainder before checking.
+            // This correctly handles negative rotations (e.g., -90) and >360 values.
+            let normalized_rot = self.rotation.rem_euclid(360);
+            
+            if normalized_rot == 90 || normalized_rot == 270 {
                 self.base_width = h as f32;
                 self.base_height = w as f32;
             } else {
@@ -609,6 +603,10 @@ fn main() {
 
     let mut last_middle_click_time = Instant::now() - Duration::from_secs(1);
 
+    // --- Controller Initialization ---
+    // Wrapped in Option so it fails silently if no gamepad backend exists
+    let mut gilrs = Gilrs::new().ok();
+
     let _ = event_loop.run(move |event, elwt| {
         elwt.set_control_flow(ControlFlow::Poll);
 
@@ -672,7 +670,7 @@ fn main() {
                     
                     if state == ElementState::Pressed {
                         let now = Instant::now();
-                        if now.duration_since(last_middle_click_time) < Duration::from_millis(450) {
+                        if now.duration_since(last_middle_click_time) < Duration::from_millis(250) {
                             // Double Middle Click -> Close App
                             elwt.exit();
                         }
@@ -830,6 +828,77 @@ fn main() {
                 _ => (),
             },
             Event::AboutToWait => {
+                // --- Controller Input Polling ---
+                if let Some(gilrs) = &mut gilrs {
+                    // Pump discrete events
+                    while let Some(gilrs::Event { event, .. }) = gilrs.next_event() {
+                        match event {
+                            gilrs::EventType::ButtonPressed(Button::RightTrigger, _) => app_state.trigger_load_next(1), // RB
+                            gilrs::EventType::ButtonPressed(Button::LeftTrigger, _) => app_state.trigger_load_next(-1), // LB
+                            gilrs::EventType::ButtonPressed(Button::South, _) | gilrs::EventType::ButtonPressed(Button::West, _) => {
+                                app_state.reset_view(); // A and X
+                            }
+                            gilrs::EventType::ButtonPressed(Button::East, _) => {
+                                elwt.exit(); // B
+                            }
+                            gilrs::EventType::ButtonPressed(Button::North, _) => { // Y Button
+                                if window.fullscreen().is_some() {
+                                    window.set_fullscreen(None);
+                                } else {
+                                    window.set_fullscreen(Some(
+                                        winit::window::Fullscreen::Borderless(
+                                            window.current_monitor(),
+                                        ),
+                                    ));
+                                }
+                            }
+                            gilrs::EventType::ButtonPressed(Button::DPadRight, _) => {
+                                // Rotate Right
+                                app_state.rotate(-1);
+                            }
+                            gilrs::EventType::ButtonPressed(Button::DPadLeft, _) => {
+                                // Rotate Left
+                                app_state.rotate(1);
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // Pump continuous axis events for smooth pan and zoom
+                    for (_id, gamepad) in gilrs.gamepads() {
+                        // Deadzones are applied manually below (0.15 threshold)
+                        let rx = gamepad.value(Axis::RightStickX);
+                        let ry = gamepad.value(Axis::RightStickY);
+
+                        if rx.abs() > 0.15 {
+                            // Reduced speed multiplier to 0.01
+                            app_state.view_x += rx * 0.01;
+                        }
+                        if ry.abs() > 0.15 {
+                            // Reduced speed multiplier to 0.01
+                            app_state.view_y += ry * 0.01;
+                        }
+
+                        let lz = gamepad.value(Axis::LeftZ);  // LT
+                        let rz = gamepad.value(Axis::RightZ); // RT
+
+                        if rz > 0.1 || lz > 0.1 {
+                            // Center zoom tracking on the middle of the screen when using controller
+                            let win_size = window.inner_size();
+                            app_state.zoom_focus = (win_size.width as f32 / 2.0, win_size.height as f32 / 2.0);
+
+                            if rz > 0.1 {
+                                // Slightly reduced zoom speed
+                                app_state.target_zoom += rz * 0.000002; 
+                            }
+                            if lz > 0.1 {
+                                // Slightly reduced zoom speed
+                                app_state.target_zoom -= lz * 0.000002; 
+                            }
+                        }
+                    }
+                }
+
                 // --- Single Click Timeouts ---
                 if pending_left_click && left_click_timer.elapsed() >= Duration::from_millis(250) {
                     app_state.trigger_load_next(1);

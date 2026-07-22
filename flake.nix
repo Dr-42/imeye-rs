@@ -21,6 +21,7 @@
           libXcursor
           libXi
           libXrandr
+          udev
         ];
       in
       {
